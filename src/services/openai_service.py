@@ -30,6 +30,34 @@ from .response_parser import response_parser
 from .chunk_builder import chunk_builder
 
 
+class CurlStreamContext:
+    def __init__(self, session, method, url, **kwargs):
+        self.session = session
+        self.method = method
+        self.url = url
+        self.kwargs = kwargs
+        self.response = None
+
+    async def __aenter__(self):
+        # 强制开启 stream=True
+        self.response = await self.session.request(self.method, self.url, stream=True, **self.kwargs)
+        return self.response
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # response 不需要像 httpx 一样显式关闭，交由 session 管理
+        pass
+
+class CurlSessionWrapper:
+    def __init__(self, session):
+        self.session = session
+
+    def stream(self, method, url, **kwargs):
+        return CurlStreamContext(self.session, method, url, **kwargs)
+
+    async def close(self):
+        await self.session.close()
+
+
 class ChatCompletionService:
     """Encapsulate chat completion workflow independent of FastAPI layer."""
 
@@ -66,6 +94,16 @@ class ChatCompletionService:
         glm_47_aliases = {
             "glm-4.7",
         }
+        glm_5_1_aliases = {
+            settings.GLM_5_1_MODEL,
+            "GLM-5.1",
+            "glm-5.1",
+        }
+        glm_5_2_aliases = {
+            settings.GLM_5_2_MODEL,
+            "GLM-5.2",
+            "glm-5.2",
+        }
 
         if model in glm_46v_aliases:
             normalized_request = dict(request_dict)
@@ -90,6 +128,18 @@ class ChatCompletionService:
             normalized_request["_original_model"] = model
             normalized_request["model"] = "glm-5-turbo"
             normalized_request["enable_thinking"] = True
+            return normalized_request
+
+        if model in glm_5_1_aliases:
+            normalized_request = dict(request_dict)
+            normalized_request["_original_model"] = model
+            normalized_request["model"] = "glm-5.1"
+            return normalized_request
+
+        if model in glm_5_2_aliases:
+            normalized_request = dict(request_dict)
+            normalized_request["_original_model"] = model
+            normalized_request["model"] = "glm-5.2"
             return normalized_request
 
         if model in glm_47_aliases:
@@ -238,6 +288,7 @@ class ChatCompletionService:
         last_status_code = None
 
         while retry_count <= settings.MAX_RETRIES:
+            session = None
             try:
                 if retry_count > 0:
                     delay = self.calculate_backoff_delay(retry_count, last_status_code)
@@ -248,8 +299,44 @@ class ChatCompletionService:
                     )
                     await asyncio.sleep(delay)
 
-                client = request_client
+                # 采用 curl_cffi 的 AsyncSession 伪装 Chrome 浏览器指纹和绕过 WAF
+                from curl_cffi.requests import AsyncSession
+                proxies = None
+                if current_proxy:
+                    proxies = {"http": current_proxy, "https": current_proxy}
+                session = AsyncSession(impersonate="chrome", proxies=proxies, timeout=120.0)
+
                 headers = transformed["config"]["headers"].copy()
+                ua = headers.get("User-Agent") or headers.get("user-agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                
+                # 1. 预访问 Z.ai 主页初始化 WAF Cookie 并绑定 UA
+                try:
+                    await session.get("https://chat.z.ai/", headers={"User-Agent": ua}, timeout=10.0)
+                except Exception as e:
+                    error_log("预访问 Z.ai 获取 WAF Cookie 失败", error=str(e))
+
+                # 2. 重新转换请求数据以确保 chats/new 会话也带相同的 WAF Cookie
+                transformed = await self.transformer.transform_request_in(
+                    request_dict_for_transform,
+                    client=session,
+                    upstream_url=current_upstream,
+                )
+
+                # 2.5 动态获取未核销的 WAF Token 并塞入请求载荷中
+                try:
+                    from ..waf_bridge import waf_token_bridge
+                    waf_token = await waf_token_bridge.get_waf_token()
+                    transformed["body"]["captcha_verify_param"] = waf_token
+                except Exception as e:
+                    error_log("获取 WAF Token 失败，将以空参数尝试", error=str(e))
+                    transformed["body"]["captcha_verify_param"] = ""
+
+                # 获取更新后的 headers
+                headers = transformed["config"]["headers"].copy()
+                headers["X-Region"] = "overseas"
+                
+                # 3. 使用包装器伪装为 httpx.AsyncClient 的 stream API
+                client = CurlSessionWrapper(session)
 
                 attempt = retry_count + 1
                 request_stage_log(
@@ -312,6 +399,8 @@ class ChatCompletionService:
                     is_thinking_model = transformed.get("is_thinking", False)
 
                     async for line in response.aiter_lines():
+                        if isinstance(line, bytes):
+                            line = line.decode("utf-8", errors="ignore")
                         if not line:
                             continue
 
@@ -352,7 +441,41 @@ class ChatCompletionService:
 
                         if error_info:
                             error_detail = error_info.get("detail") or error_info.get("content") or "Unknown error"
-                            error_log("[UPSTREAM_ERROR] 上游返回错误", error_detail=error_detail)
+                            error_code = error_info.get("error_code") or error_info.get("code") or ""
+                            error_log(f"[UPSTREAM_ERROR] 上游返回错误: {error_detail}, 错误码: {error_code}")
+                            
+                            # 检测是否为验证码拦截
+                            is_captcha = error_code == "FRONTEND_CAPTCHA_REQUIRED" or "captcha_error_type" in error_info
+                            
+                            if is_captcha:
+                                info_log("[TOKEN] 检测到验证码拦截错误，当前Token失效，将切换Token")
+                                token_pool = await get_token_pool()
+                                current_token = transformed.get("token", "")
+                                if current_token:
+                                    token_pool.mark_token_failure(current_token)
+                                self._invalidate_transformed_conversation(transformed)
+                                
+                                await self.transformer.switch_token()
+                                transformed = await self.transformer.transform_request_in(
+                                    request_dict_for_transform,
+                                    client=session,
+                                    upstream_url=current_upstream,
+                                )
+                                raise ValueError(f"Captcha required: {error_detail}")
+                            
+                            elif "refresh the page" in error_detail.lower() or "update the app" in error_detail.lower():
+                                info_log("[FE-VERSION] 检测到版本过期错误，强制刷新FE版本并清除缓存")
+                                from ..fe_version import refresh_fe_version
+                                refresh_fe_version()
+                                
+                                # 重新生成 transformed，使 headers 使用最新的 X-Fe-Version
+                                transformed = await self.transformer.transform_request_in(
+                                    request_dict_for_transform,
+                                    client=session,
+                                    upstream_url=current_upstream,
+                                )
+                                raise ValueError(f"Version expired: {error_detail}")
+                            
                             raise HTTPException(status_code=502, detail=f"Upstream error: {error_detail}")
 
                         if data.get("usage"):
@@ -511,6 +634,7 @@ class ChatCompletionService:
         last_status_code = None
 
         while retry_count <= settings.MAX_RETRIES:
+            session = None
             try:
                 if retry_count > 0:
                     delay = self.calculate_backoff_delay(retry_count, last_status_code)
@@ -522,8 +646,44 @@ class ChatCompletionService:
                     )
                     await asyncio.sleep(delay)
 
-                client = request_client
+                # 使用 curl_cffi 的 AsyncSession 伪装 Chrome 浏览器指纹 and 绕过 WAF
+                from curl_cffi.requests import AsyncSession
+                proxies = None
+                if current_proxy:
+                    proxies = {"http": current_proxy, "https": current_proxy}
+                session = AsyncSession(impersonate="chrome", proxies=proxies, timeout=120.0)
+
                 headers = transformed["config"]["headers"].copy()
+                ua = headers.get("User-Agent") or headers.get("user-agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                
+                # 1. 预访问 Z.ai 主页初始化 WAF Cookie 并绑定 UA
+                try:
+                    await session.get("https://chat.z.ai/", headers={"User-Agent": ua}, timeout=10.0)
+                except Exception as e:
+                    error_log("预访问 Z.ai 获取 WAF Cookie 失败", error=str(e))
+
+                # 2. 重新转换请求数据以确保 chats/new 会话也带相同的 WAF Cookie
+                transformed = await self.transformer.transform_request_in(
+                    request_dict_for_transform,
+                    client=session,
+                    upstream_url=current_upstream,
+                )
+
+                # 2.5 动态获取未核销的 WAF Token 并塞入请求载荷中
+                try:
+                    from ..waf_bridge import waf_token_bridge
+                    waf_token = await waf_token_bridge.get_waf_token()
+                    transformed["body"]["captcha_verify_param"] = waf_token
+                except Exception as e:
+                    error_log("获取 WAF Token 失败，将以空参数尝试", error=str(e))
+                    transformed["body"]["captcha_verify_param"] = ""
+
+                # 获取更新后的 headers
+                headers = transformed["config"]["headers"].copy()
+                headers["X-Region"] = "overseas"
+                
+                # 3. 使用包装器伪装为 httpx.AsyncClient 的 stream API
+                client = CurlSessionWrapper(session)
 
                 attempt = retry_count + 1
                 request_stage_log(
@@ -603,6 +763,8 @@ class ChatCompletionService:
                             )
 
                     async for line in response.aiter_lines():
+                        if isinstance(line, bytes):
+                            line = line.decode("utf-8", errors="ignore")
                         if not line or not line.strip():
                             continue
 
@@ -643,7 +805,43 @@ class ChatCompletionService:
 
                         if error_info:
                             error_detail = error_info.get("detail") or error_info.get("content") or "Unknown error"
-                            error_log(f"[UPSTREAM_ERROR] 上游返回错误: {error_detail}")
+                            error_code = error_info.get("error_code") or error_info.get("code") or ""
+                            error_log(f"[UPSTREAM_ERROR] 上游返回错误: {error_detail}, 错误码: {error_code}")
+                            
+                            # 检测是否为验证码拦截
+                            is_captcha = error_code == "FRONTEND_CAPTCHA_REQUIRED" or "captcha_error_type" in error_info
+                            
+                            if is_captcha:
+                                info_log("[TOKEN] 检测到验证码拦截错误，当前Token失效，将切换Token")
+                                token_pool = await get_token_pool()
+                                current_token = transformed.get("token", "")
+                                if current_token:
+                                    token_pool.mark_token_failure(current_token)
+                                self._invalidate_transformed_conversation(transformed)
+                                
+                                await self.transformer.switch_token()
+                                if not answer_accumulator and not thinking_accumulator:
+                                    transformed = await self.transformer.transform_request_in(
+                                        request_dict_for_transform,
+                                        client=session,
+                                        upstream_url=current_upstream,
+                                    )
+                                    raise ValueError(f"Captcha required: {error_detail}")
+                            
+                            elif "refresh the page" in error_detail.lower() or "update the app" in error_detail.lower():
+                                info_log("[FE-VERSION] 检测到版本过期错误，强制刷新FE版本并清除缓存")
+                                from ..fe_version import refresh_fe_version
+                                refresh_fe_version()
+                                
+                                # 如果还没向客户端发送任何实质的聊天回复，直接抛出异常进行重试
+                                if not answer_accumulator and not thinking_accumulator:
+                                    # 重新生成 transformed，使 headers 使用最新的 X-Fe-Version
+                                    transformed = await self.transformer.transform_request_in(
+                                        request_dict_for_transform,
+                                        client=session,
+                                        upstream_url=current_upstream,
+                                    )
+                                    raise ValueError(f"Version expired: {error_detail}")
                             
                             if not has_thinking:
                                 has_thinking = True
@@ -899,6 +1097,8 @@ class ChatCompletionService:
                     error_log("[REQUEST] 流式响应错误")
                     return
             finally:
+                if session:
+                    await session.close()
                 reset_request_context("mode")
 
     async def _mark_token_success(self, transformed: dict) -> None:

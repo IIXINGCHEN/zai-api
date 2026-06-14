@@ -118,6 +118,18 @@ def get_latest_fe_version(force_refresh: bool = False) -> str:
                 # 检查是否有更新
                 if version != _cached_version:
                     info_log("[FE-VERSION] 检测到版本更新", new_version=version, old_version=_cached_version or "无")
+                    try:
+                        from .header_manager import header_manager
+                        header_manager.clear_header_template_sync()
+                    except Exception as e:
+                        error_log(f"[FE-VERSION] 清理Header缓存失败: {e}")
+                
+                # 同步更新 settings 中的静态值，以防其他地方使用了它
+                try:
+                    from .config import settings
+                    settings.ZAI_FE_VERSION = version
+                except Exception as e:
+                    error_log(f"[FE-VERSION] 更新settings.ZAI_FE_VERSION失败: {e}")
                 
                 # 更新缓存
                 _cached_version = version
@@ -140,7 +152,13 @@ def refresh_fe_version() -> str:
     Returns:
         最新的版本号字符串
     """
-    return get_latest_fe_version(force_refresh=True)
+    version = get_latest_fe_version(force_refresh=True)
+    try:
+        from .header_manager import header_manager
+        header_manager.clear_header_template_sync()
+    except Exception as e:
+        error_log(f"[FE-VERSION] 强制刷新后清理Header缓存失败: {e}")
+    return version
 
 
 def get_fe_version_with_fallback(fallback: Optional[str] = None) -> Optional[str]:

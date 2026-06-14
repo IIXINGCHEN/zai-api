@@ -18,6 +18,21 @@ app = FastAPI(
     version="1.0.0-dev",
 )
 
+
+@app.on_event("startup")
+async def startup_event():
+    """Startup event handler to pre-heat the WAF Token bridge"""
+    import asyncio
+    try:
+        from src.waf_bridge import waf_token_bridge
+        from src.helpers import info_log, error_log
+        # 异步启动并热身浏览器，不阻塞 FastAPI 启动
+        asyncio.create_task(waf_token_bridge.get_waf_token())
+        info_log("[CDP] 成功启动 WAF Token 桥接后台热身任务")
+    except Exception as e:
+        from src.helpers import error_log
+        error_log(f"[CDP] 启动 WAF Token 桥接后台热身任务失败: {e}")
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +66,16 @@ async def root():
 async def health():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Shutdown event handler to clean up background processes"""
+    try:
+        from src.waf_bridge import waf_token_bridge
+        waf_token_bridge.clean_up()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

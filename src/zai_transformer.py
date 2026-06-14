@@ -36,11 +36,15 @@ PUBLIC_GLM_46V_MODEL = "glm-4.6v"
 PUBLIC_GLM_5V_TURBO_MODEL = "glm-5v-turbo"
 PUBLIC_GLM_5_MODEL = "glm-5"
 PUBLIC_GLM_5_TURBO_MODEL = "glm-5-turbo"
+PUBLIC_GLM_5_1_MODEL = "glm-5.1"
+PUBLIC_GLM_5_2_MODEL = "glm-5.2"
 PUBLIC_GLM_47_MODEL = "glm-4.7"
 LEGACY_GLM_46V_ALIASES = frozenset({"GLM-4.6V"})
 LEGACY_GLM_5V_TURBO_ALIASES = frozenset({"GLM-5v-Turbo"})
 LEGACY_GLM_5_ALIASES = frozenset({"GLM-5", "GLM-5-Think"})
 LEGACY_GLM_5_TURBO_ALIASES = frozenset({"GLM-5-Turbo"})
+LEGACY_GLM_5_1_ALIASES = frozenset({"GLM-5.1"})
+LEGACY_GLM_5_2_ALIASES = frozenset({"GLM-5.2"})
 
 
 
@@ -141,7 +145,7 @@ class ZAITransformer:
     async def refresh_header_template(self):
         """刷新header模板（清除缓存并重新生成）"""
         await header_manager.clear_header_template()
-        info_log("🔄 Header模板已刷新，下次请求将使用新的header")
+        info_log("[REFRESH] Header模板已刷新，下次请求将使用新的header")
 
     def _resolve_base_url(self, upstream_url: Optional[str] = None) -> str:
         """从 completions 地址解析出站点根地址。"""
@@ -232,6 +236,7 @@ class ZAITransformer:
             **dynamic_headers,
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
+            "X-Region": "overseas",
         }
 
         create_chat_url = f"{self._resolve_base_url(upstream_url)}/api/v1/chats/new"
@@ -318,6 +323,11 @@ class ZAITransformer:
             *LEGACY_GLM_5_TURBO_ALIASES,
         }:
             return PUBLIC_GLM_5_TURBO_MODEL
+        if normalized_model in {
+            PUBLIC_GLM_5_1_MODEL,
+            *LEGACY_GLM_5_1_ALIASES,
+        }:
+            return PUBLIC_GLM_5_1_MODEL
         if self._is_glm_5_family_model(normalized_model):
             return PUBLIC_GLM_5_MODEL
         if self._is_glm_47_model(normalized_model):
@@ -565,11 +575,13 @@ class ZAITransformer:
         is_glm_5v_turbo_model = requested_model == PUBLIC_GLM_5V_TURBO_MODEL
         is_glm_5_model = requested_model == PUBLIC_GLM_5_MODEL
         is_glm_5_turbo_model = requested_model == PUBLIC_GLM_5_TURBO_MODEL
+        is_glm_5_1_model = requested_model == PUBLIC_GLM_5_1_MODEL
+        is_glm_5_2_model = requested_model == PUBLIC_GLM_5_2_MODEL
         is_glm_47_model = requested_model == PUBLIC_GLM_47_MODEL
         is_thinking = is_vision_model
-        if is_glm_5_model or is_glm_5_turbo_model or is_glm_47_model:
+        if is_glm_5_model or is_glm_5_turbo_model or is_glm_47_model or is_glm_5_1_model or is_glm_5_2_model:
             is_thinking = self._resolve_glm_5_thinking(request)
-        is_simplified_model = is_glm_5_model or is_glm_5_turbo_model or is_glm_47_model or is_glm_5v_turbo_model
+        is_simplified_model = is_glm_5_model or is_glm_5_turbo_model or is_glm_47_model or is_glm_5v_turbo_model or is_glm_5_1_model or is_glm_5_2_model
 
         if is_glm_5v_turbo_model:
             upstream_model_id = "GLM-5v-Turbo"
@@ -579,6 +591,10 @@ class ZAITransformer:
             upstream_model_id = PUBLIC_GLM_47_MODEL
         elif is_glm_5_turbo_model:
             upstream_model_id = "GLM-5-Turbo"
+        elif is_glm_5_1_model:
+            upstream_model_id = "GLM-5.1"
+        elif is_glm_5_2_model:
+            upstream_model_id = "GLM-5.2"
         elif is_glm_5_model:
             upstream_model_id = PUBLIC_GLM_5_MODEL
         else:
@@ -753,7 +769,8 @@ class ZAITransformer:
         api_url = upstream_url if upstream_url else settings.API_ENDPOINT
         debug_log(f"使用上游地址: {api_url}")
 
-        url_with_params = f"{api_url}?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+        import urllib.parse
+        url_with_params = f"{api_url}?" + urllib.parse.urlencode(query_params, quote_via=urllib.parse.quote)
 
         headers = {
             **dynamic_headers,

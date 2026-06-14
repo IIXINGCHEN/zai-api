@@ -84,7 +84,11 @@ class HeaderManager:
             # 设置特定于 Z.AI 的 headers
             base_headers["Origin"] = "https://chat.z.ai"
             base_headers["Content-Type"] = "application/json"
-            base_headers["X-Fe-Version"] = settings.ZAI_FE_VERSION
+            
+            # 动态获取最新的 FE 版本号，避免使用内存中写死的静态值
+            from .fe_version import get_fe_version_with_fallback
+            fe_version = get_fe_version_with_fallback(fallback=settings.ZAI_FE_VERSION or settings._env_fe_version)
+            base_headers["X-Fe-Version"] = fe_version
             
             # 设置 Fetch 相关 headers（用于 CORS 请求）
             base_headers["Sec-Fetch-Dest"] = "empty"
@@ -105,7 +109,7 @@ class HeaderManager:
             base_headers["Connection"] = "keep-alive"
             
             self._header_template_cache = base_headers
-            info_log(" Header模板已缓存", 
+            info_log("[CONFIG] Header模板已缓存", 
                      user_agent=base_headers.get("User-Agent", "")[:50],
                      has_sec_ch_ua=("sec-ch-ua" in base_headers or "Sec-Ch-Ua" in base_headers))
         
@@ -114,8 +118,12 @@ class HeaderManager:
     async def clear_header_template(self):
         """清除缓存的 header 模板，强制下次调用时重新生成（线程安全）"""
         async with self._cache_lock:
-            self._header_template_cache = None
-            info_log("🔄 Header模板缓存已清除")
+            self.clear_header_template_sync()
+
+    def clear_header_template_sync(self):
+        """清除缓存的 header 模板（同步版本）"""
+        self._header_template_cache = None
+        info_log("[REFRESH] Header模板缓存已清除")
     
     async def get_dynamic_headers(self, chat_id: str = "", user_agent: str = "") -> Dict[str, str]:
         """
@@ -168,7 +176,8 @@ class HeaderManager:
             url = furl("https://chat.z.ai")
             pathname = "/"
         
-        tz = get_timezone("Asia/Shanghai")
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
         
         # 构建完整的查询参数
         query_params = {
@@ -201,8 +210,8 @@ class HeaderManager:
             "referrer": "",
             "title": "Z.ai Chat - Free AI powered by GLM-5",
             "timezone_offset": "-480",
-            "local_time": datetime.now(tz=tz).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-            "utc_time": datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            "local_time": now_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "utc_time": now_utc.strftime("%a, %d %b %Y %H:%M:%S GMT"),
             "is_mobile": "false",
             "is_touch": "false",
             "max_touch_points": "10",
